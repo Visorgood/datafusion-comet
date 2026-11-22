@@ -3669,6 +3669,58 @@ class CometIcebergWriteActionSuite
     }
   }
 
+  // parquet-java leaves a column chunk's statistics out of the file it writes when the chunk's min
+  // and max together take 4096 bytes or more (`ParquetMetadataConverter.MAX_STATS_SIZE`), but
+  // iceberg-java takes its manifest metrics from the footer it still holds in memory, which keeps
+  // them. The native path reads the footer back from the file, where parquet-rs keeps statistics
+  // of any size, so both commit the same counts and bounds. A single 2047-byte value stays under
+  // the limit (2047 + 2047); a 2048-byte value reaches it (2048 + 2048). Under `full` the bounds
+  // are the whole values, which pins that the native footer keeps its statistics untruncated.
+  test("native acceleration: string and binary bounds past parquet-java's 4 KiB stats limit") {
+    assumeNativeAcceleration()
+    withIcebergCatalog { _ =>
+      val (native, jvm) = manifestMetricsParity(
+        "stats_limit",
+        t => Seq(s"""
+          CREATE TABLE $t (id INT, under STRING, over STRING, bin_over BINARY, over_full STRING)
+          USING iceberg
+          TBLPROPERTIES ('write.metadata.metrics.column.over_full'='full')
+        """),
+        t => s"""
+          INSERT INTO $t VALUES
+            (1, repeat('a', 2047), repeat('b', 2048), CAST(repeat('c', 2048) AS BINARY),
+              repeat('d', 2048)),
+            (2, NULL, NULL, NULL, NULL)
+        """,
+        f => s"""
+          SELECT
+            sum(readable_metrics.under.value_count),
+            sum(readable_metrics.under.null_value_count),
+            min(readable_metrics.under.lower_bound),
+            max(readable_metrics.under.upper_bound),
+            sum(readable_metrics.over.value_count),
+            sum(readable_metrics.over.null_value_count),
+            min(readable_metrics.over.lower_bound),
+            max(readable_metrics.over.upper_bound),
+            sum(readable_metrics.bin_over.value_count),
+            sum(readable_metrics.bin_over.null_value_count),
+            hex(min(readable_metrics.bin_over.lower_bound)),
+            hex(max(readable_metrics.bin_over.upper_bound)),
+            sum(readable_metrics.over_full.value_count),
+            sum(readable_metrics.over_full.null_value_count),
+            length(min(readable_metrics.over_full.lower_bound)),
+            md5(min(readable_metrics.over_full.lower_bound)),
+            md5(max(readable_metrics.over_full.upper_bound))
+          FROM $f
+        """)
+      assert(
+        Seq(2, 3, 6, 7, 10, 11, 15, 16).forall(i => !jvm.isNullAt(i)),
+        s"expected iceberg-java to keep bounds for every column, got $jvm")
+      assert(jvm.getInt(14) == 2048, s"expected the whole value as the `full` bound, got $jvm")
+      assert(native == jvm, s"native $native != jvm $jvm")
+    }
+  }
+
   // iceberg-java's `PartitionSpec.partitionToPath` runs every partition name and value through
   // `URLEncoder.encode`, and iceberg-rust's `partition_to_path` uses the same
   // application/x-www-form-urlencoded table (apache/iceberg-rust#2875). Readers resolve files
